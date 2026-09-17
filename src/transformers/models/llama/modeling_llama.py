@@ -49,6 +49,21 @@ from .configuration_llama import LlamaConfig
 logger = logging.get_logger(__name__)
 
 
+def _apply_4_to_8_sparsity(tensor: torch.Tensor) -> torch.Tensor:
+    """Keep the four largest-magnitude values in each 8-value tile along the last dimension."""
+    tile_size = 8
+    values_to_keep = 4
+
+    if tensor.shape[-1] % tile_size != 0:
+        raise ValueError(f"4:8 sparsity requires the last dimension to be divisible by 8, got {tensor.shape[-1]}")
+
+    tiles = tensor.reshape(*tensor.shape[:-1], -1, tile_size)
+    keep_indices = tiles.abs().topk(values_to_keep, dim=-1, largest=True, sorted=False).indices
+    keep_mask = torch.zeros_like(tiles, dtype=torch.bool)
+    keep_mask.scatter_(-1, keep_indices, True)
+    return tiles.masked_fill(~keep_mask, 0).reshape_as(tensor)
+
+
 @use_kernel_forward_from_hub("RMSNorm")
 class LlamaRMSNorm(nn.Module):
     def __init__(self, hidden_size, eps: float = 1e-6) -> None:
@@ -248,6 +263,16 @@ class LlamaAttention(nn.Module):
             config.num_attention_heads * self.head_dim, config.hidden_size, bias=config.attention_bias
         )
 
+    def _sparsify_kv(self, tensor: torch.Tensor, target: str) -> torch.Tensor:
+        sparsity_enabled = getattr(self.config, "sparsity_4_to_8_enabled", False)
+        k_layers = getattr(self.config, "sparsity_4_to_8_k_layers", ()) or ()
+        v_layers = getattr(self.config, "sparsity_4_to_8_v_layers", ()) or ()
+        target_layers = getattr(self.config, f"sparsity_4_to_8_{target}_layers", ()) or ()
+        has_layer_selection = bool(k_layers or v_layers)
+        if not sparsity_enabled or (has_layer_selection and self.layer_idx not in target_layers):
+            return tensor
+        return _apply_4_to_8_sparsity(tensor)
+
     def forward(
         self,
         hidden_states: torch.Tensor,
@@ -265,6 +290,9 @@ class LlamaAttention(nn.Module):
 
         cos, sin = position_embeddings
         query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin)
+
+        key_states = self._sparsify_kv(key_states, target="k")
+        value_states = self._sparsify_kv(value_states, target="v")
 
         if past_key_values is not None:
             key_states, value_states = past_key_values.update(key_states, value_states, self.layer_idx)
